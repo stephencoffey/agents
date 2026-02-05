@@ -1149,6 +1149,13 @@ export class TestStateAgent extends Agent<Env, TestState> {
 
   // Test helper to insert corrupted state directly into DB (without caching)
   insertCorruptedState() {
+    // First, create the state table (since lazy table creation means it may not exist yet)
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS cf_agents_state (
+        id TEXT PRIMARY KEY NOT NULL,
+        state TEXT
+      )
+    `);
     // Insert invalid JSON directly, also set wasChanged to trigger the read path
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO cf_agents_state (id, state) VALUES ('STATE', 'invalid{json')`

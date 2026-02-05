@@ -184,6 +184,24 @@ export type QueueItem<T = string> = {
 };
 
 /**
+ * Configuration options for Agent database features.
+ * Use these options to disable features and prevent their associated
+ * database tables from being created.
+ */
+export type AgentConfig = {
+  /** Skip creating and using cf_agents_state table for state persistence */
+  disableStatePersistence?: boolean;
+  /** Skip creating and using cf_agents_schedules table for scheduling */
+  disableScheduling?: boolean;
+  /** Skip creating and using cf_agents_queues table for queue system */
+  disableQueue?: boolean;
+  /** Skip creating and using cf_agents_mcp_servers table for MCP servers */
+  disableMcp?: boolean;
+  /** Skip creating and using cf_agents_workflows table for workflow tracking */
+  disableWorkflows?: boolean;
+};
+
+/**
  * Represents a scheduled task within an Agent
  * @template T Type of the payload data
  */
@@ -402,7 +420,38 @@ export class Agent<
   private _ParentClass: typeof Agent<Env, State> =
     Object.getPrototypeOf(this).constructor;
 
-  readonly mcp: MCPClientManager;
+  readonly mcp!: MCPClientManager;
+
+  /**
+   * Configuration for optional database features.
+   * Override to disable specific features and prevent their tables from being created.
+   *
+   * @example
+   * ```typescript
+   * class MinimalAgent extends Agent<Env> {
+   *   config = {
+   *     disableStatePersistence: true,
+   *     disableScheduling: true,
+   *     disableQueue: true,
+   *     disableMcp: true,
+   *     disableWorkflows: true
+   *   };
+   * }
+   * ```
+   */
+  config: AgentConfig = {};
+
+  /**
+   * Tracks which tables have been lazily created
+   * @internal
+   */
+  private _tablesCreated = {
+    state: false,
+    mcp: false,
+    queues: false,
+    schedules: false,
+    workflows: false
+  };
 
   /**
    * Initial state for the Agent
@@ -414,6 +463,8 @@ export class Agent<
    * Current state of the Agent
    */
   get state(): State {
+    // Ensure state table exists before accessing state
+    this._ensureStateTable();
     if (this._state !== DEFAULT_STATE) {
       // state was previously set, and populated internal state
       return this._state;
@@ -527,26 +578,19 @@ export class Agent<
       throw this.onError(new SqlError(query, e));
     }
   }
-  constructor(ctx: AgentContext, env: Env) {
-    super(ctx, env);
 
-    if (!wrappedClasses.has(this.constructor)) {
-      // Auto-wrap custom methods with agent context
-      this._autoWrapCustomMethods();
-      wrappedClasses.add(this.constructor);
+  /**
+   * Lazily create the state persistence table if not already created
+   * @internal
+   */
+  private _ensureStateTable() {
+    if (this._tablesCreated.state) return;
+    if (this.config.disableStatePersistence) {
+      throw new Error(
+        "State persistence is disabled via config.disableStatePersistence. " +
+          "Remove this flag to use this.state or this.setState()."
+      );
     }
-
-    this.sql`
-        CREATE TABLE IF NOT EXISTS cf_agents_mcp_servers (
-          id TEXT PRIMARY KEY NOT NULL,
-          name TEXT NOT NULL,
-          server_url TEXT NOT NULL,
-          callback_url TEXT NOT NULL,
-          client_id TEXT,
-          auth_url TEXT,
-          server_options TEXT
-        )
-      `;
 
     this.sql`
       CREATE TABLE IF NOT EXISTS cf_agents_state (
@@ -554,6 +598,48 @@ export class Agent<
         state TEXT
       )
     `;
+    this._tablesCreated.state = true;
+  }
+
+  /**
+   * Lazily create the MCP servers table if not already created
+   * @internal
+   */
+  private _ensureMcpTable() {
+    if (this._tablesCreated.mcp) return;
+    if (this.config.disableMcp) {
+      throw new Error(
+        "MCP is disabled via config.disableMcp. " +
+          "Remove this flag to use MCP-related methods."
+      );
+    }
+
+    this.sql`
+      CREATE TABLE IF NOT EXISTS cf_agents_mcp_servers (
+        id TEXT PRIMARY KEY NOT NULL,
+        name TEXT NOT NULL,
+        server_url TEXT NOT NULL,
+        callback_url TEXT NOT NULL,
+        client_id TEXT,
+        auth_url TEXT,
+        server_options TEXT
+      )
+    `;
+    this._tablesCreated.mcp = true;
+  }
+
+  /**
+   * Lazily create the queues table if not already created
+   * @internal
+   */
+  private _ensureQueuesTable() {
+    if (this._tablesCreated.queues) return;
+    if (this.config.disableQueue) {
+      throw new Error(
+        "Queue system is disabled via config.disableQueue. " +
+          "Remove this flag to use this.queue() and related methods."
+      );
+    }
 
     this.sql`
       CREATE TABLE IF NOT EXISTS cf_agents_queues (
@@ -563,6 +649,21 @@ export class Agent<
         created_at INTEGER DEFAULT (unixepoch())
       )
     `;
+    this._tablesCreated.queues = true;
+  }
+
+  /**
+   * Lazily create the schedules table if not already created
+   * @internal
+   */
+  private _ensureSchedulesTable() {
+    if (this._tablesCreated.schedules) return;
+    if (this.config.disableScheduling) {
+      throw new Error(
+        "Scheduling is disabled via config.disableScheduling. " +
+          "Remove this flag to use this.schedule() and related methods."
+      );
+    }
 
     this.sql`
       CREATE TABLE IF NOT EXISTS cf_agents_schedules (
@@ -578,6 +679,7 @@ export class Agent<
         created_at INTEGER DEFAULT (unixepoch())
       )
     `;
+    this._tablesCreated.schedules = true;
 
     // Migration: Add columns for interval scheduling (for existing agents)
     // Use raw exec to avoid error logging through onError for expected failures
@@ -602,6 +704,20 @@ export class Agent<
     addColumnIfNotExists(
       "ALTER TABLE cf_agents_schedules ADD COLUMN execution_started_at INTEGER"
     );
+  }
+
+  /**
+   * Lazily create the workflows table if not already created
+   * @internal
+   */
+  private _ensureWorkflowsTable() {
+    if (this._tablesCreated.workflows) return;
+    if (this.config.disableWorkflows) {
+      throw new Error(
+        "Workflows are disabled via config.disableWorkflows. " +
+          "Remove this flag to use workflow-related methods."
+      );
+    }
 
     // Workflow tracking table for Agent-Workflow integration
     this.sql`
@@ -631,24 +747,45 @@ export class Agent<
       CREATE INDEX IF NOT EXISTS idx_workflows_name ON cf_agents_workflows(workflow_name)
     `;
 
-    // Initialize MCPClientManager AFTER tables are created
-    this.mcp = new MCPClientManager(this._ParentClass.name, "0.0.1", {
-      storage: this.ctx.storage
-    });
+    this._tablesCreated.workflows = true;
+  }
 
-    // Broadcast server state whenever MCP state changes (register, connect, OAuth, remove, etc.)
-    this._disposables.add(
-      this.mcp.onServerStateChanged(async () => {
-        this.broadcastMcpServers();
-      })
-    );
+  constructor(ctx: AgentContext, env: Env) {
+    super(ctx, env);
 
-    // Emit MCP observability events
-    this._disposables.add(
-      this.mcp.onObservabilityEvent((event) => {
-        this.observability?.emit(event);
-      })
-    );
+    if (!wrappedClasses.has(this.constructor)) {
+      // Auto-wrap custom methods with agent context
+      this._autoWrapCustomMethods();
+      wrappedClasses.add(this.constructor);
+    }
+
+    // Lazy table creation: tables are now created on-demand when features are used
+    // This reduces storage overhead for agents that don't use all features
+
+    // Only initialize MCPClientManager if MCP is not disabled
+    if (!this.config.disableMcp) {
+      (this as { mcp: MCPClientManager }).mcp = new MCPClientManager(
+        this._ParentClass.name,
+        "0.0.1",
+        {
+          storage: this.ctx.storage
+        }
+      );
+
+      // Broadcast server state whenever MCP state changes (register, connect, OAuth, remove, etc.)
+      this._disposables.add(
+        this.mcp.onServerStateChanged(async () => {
+          this.broadcastMcpServers();
+        })
+      );
+
+      // Emit MCP observability events
+      this._disposables.add(
+        this.mcp.onObservabilityEvent((event) => {
+          this.observability?.emit(event);
+        })
+      );
+    }
 
     const _onRequest = this.onRequest.bind(this);
     this.onRequest = (request: Request) => {
@@ -852,11 +989,17 @@ export class Agent<
         },
         async () => {
           await this._tryCatch(async () => {
-            await this.mcp.restoreConnectionsFromStorage(this.name);
-            this.broadcastMcpServers();
+            if (!this.config.disableMcp) {
+              this._ensureMcpTable();
+              await this.mcp.restoreConnectionsFromStorage(this.name);
+              this.broadcastMcpServers();
+            }
 
             // Check for orphaned workflows (tracked but binding no longer exists)
-            this._checkOrphanedWorkflows();
+            if (!this.config.disableWorkflows) {
+              this._ensureWorkflowsTable();
+              this._checkOrphanedWorkflows();
+            }
 
             return _onStart(props);
           });
@@ -919,6 +1062,9 @@ export class Agent<
     nextState: State,
     source: Connection | "server" = "server"
   ): void {
+    // Ensure state table exists
+    this._ensureStateTable();
+
     // Validation/gating hook (sync only)
     this.validateStateChange(nextState, source);
 
@@ -1218,6 +1364,9 @@ export class Agent<
    * @returns The ID of the queued task
    */
   async queue<T = unknown>(callback: keyof this, payload: T): Promise<string> {
+    // Ensure queues table exists
+    this._ensureQueuesTable();
+
     const id = nanoid(9);
     if (typeof callback !== "string") {
       throw new Error("Callback must be a string");
@@ -1246,6 +1395,10 @@ export class Agent<
       return;
     }
     this._flushingQueue = true;
+
+    // Ensure queues table exists
+    this._ensureQueuesTable();
+
     while (true) {
       const result = this.sql<QueueItem<string>>`
       SELECT * FROM cf_agents_queues
@@ -1291,6 +1444,8 @@ export class Agent<
    * @param id ID of the task to dequeue
    */
   async dequeue(id: string) {
+    // Ensure queues table exists
+    this._ensureQueuesTable();
     this.sql`DELETE FROM cf_agents_queues WHERE id = ${id}`;
   }
 
@@ -1298,6 +1453,8 @@ export class Agent<
    * Dequeue all tasks
    */
   async dequeueAll() {
+    // Ensure queues table exists
+    this._ensureQueuesTable();
     this.sql`DELETE FROM cf_agents_queues`;
   }
 
@@ -1306,6 +1463,8 @@ export class Agent<
    * @param callback Name of the callback to dequeue
    */
   async dequeueAllByCallback(callback: string) {
+    // Ensure queues table exists
+    this._ensureQueuesTable();
     this.sql`DELETE FROM cf_agents_queues WHERE callback = ${callback}`;
   }
 
@@ -1315,6 +1474,8 @@ export class Agent<
    * @returns The task or undefined if not found
    */
   async getQueue(id: string): Promise<QueueItem<string> | undefined> {
+    // Ensure queues table exists
+    this._ensureQueuesTable();
     const result = this.sql<QueueItem<string>>`
       SELECT * FROM cf_agents_queues WHERE id = ${id}
     `;
@@ -1330,6 +1491,8 @@ export class Agent<
    * @returns Array of matching QueueItem objects
    */
   async getQueues(key: string, value: string): Promise<QueueItem<string>[]> {
+    // Ensure queues table exists
+    this._ensureQueuesTable();
     const result = this.sql<QueueItem<string>>`
       SELECT * FROM cf_agents_queues
     `;
@@ -1349,6 +1512,9 @@ export class Agent<
     callback: keyof this,
     payload?: T
   ): Promise<Schedule<T>> {
+    // Ensure schedules table exists
+    this._ensureSchedulesTable();
+
     const id = nanoid(9);
 
     const emitScheduleCreate = (schedule: Schedule<T>) =>
@@ -1467,6 +1633,9 @@ export class Agent<
     callback: keyof this,
     payload?: T
   ): Promise<Schedule<T>> {
+    // Ensure schedules table exists
+    this._ensureSchedulesTable();
+
     // DO alarms have a max schedule time of 30 days
     const MAX_INTERVAL_SECONDS = 30 * 24 * 60 * 60; // 30 days in seconds
 
@@ -1532,6 +1701,9 @@ export class Agent<
    * @returns The Schedule object or undefined if not found
    */
   async getSchedule<T = string>(id: string): Promise<Schedule<T> | undefined> {
+    // Ensure schedules table exists
+    this._ensureSchedulesTable();
+
     const result = this.sql<Schedule<string>>`
       SELECT * FROM cf_agents_schedules WHERE id = ${id}
     `;
@@ -1555,6 +1727,9 @@ export class Agent<
       timeRange?: { start?: Date; end?: Date };
     } = {}
   ): Schedule<T>[] {
+    // Ensure schedules table exists
+    this._ensureSchedulesTable();
+
     let query = "SELECT * FROM cf_agents_schedules WHERE 1=1";
     const params = [];
 
@@ -1621,6 +1796,9 @@ export class Agent<
   }
 
   private async _scheduleNextAlarm() {
+    // Ensure schedules table exists
+    this._ensureSchedulesTable();
+
     // Find the next schedule that needs to be executed
     const result = this.sql`
       SELECT time FROM cf_agents_schedules
@@ -1645,6 +1823,9 @@ export class Agent<
    * See {@link https://developers.cloudflare.com/agents/api-reference/schedule-tasks/}
    */
   public readonly alarm = async () => {
+    // Ensure schedules table exists
+    this._ensureSchedulesTable();
+
     const now = Math.floor(Date.now() / 1000);
 
     // Get all schedules that should be executed now
@@ -1873,6 +2054,9 @@ export class Agent<
     params: P,
     options?: RunWorkflowOptions
   ): Promise<string> {
+    // Ensure workflows table exists
+    this._ensureWorkflowsTable();
+
     // Look up the workflow binding by name
     const workflow = this._findWorkflowBindingByName(workflowName);
     if (!workflow) {
@@ -2433,6 +2617,9 @@ export class Agent<
    * @returns Workflow info or undefined if not found
    */
   getWorkflow(workflowId: string): WorkflowInfo | undefined {
+    // Ensure workflows table exists
+    this._ensureWorkflowsTable();
+
     const rows = this.sql<WorkflowTrackingRow>`
       SELECT * FROM cf_agents_workflows WHERE workflow_id = ${workflowId}
     `;
@@ -2466,6 +2653,9 @@ export class Agent<
    * ```
    */
   getWorkflows(criteria: WorkflowQueryCriteria = {}): WorkflowPage {
+    // Ensure workflows table exists
+    this._ensureWorkflowsTable();
+
     const limit = Math.min(criteria.limit ?? 50, 100);
     const isAsc = criteria.orderBy === "asc";
 
